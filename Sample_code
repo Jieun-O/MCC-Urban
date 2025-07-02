@@ -1,0 +1,402 @@
+###################################################################################################################
+## Sample R code for the MCC-Urban subproject
+## "Multi-country multi-city study on heterogeneous impacts of urbanicity on heat-related mortality" 
+## Jieun Oh and Yoorim Bang
+## July, 2025
+###################################################################################################################
+
+# (Note) =================================
+# This is mock (sample) data, not real data.
+# Therefore, the analysis results do not reflect actual results.
+# ========================================
+
+library(tsModel)
+library(splines)
+library(dlnm)
+library(mixmeta)
+library(dplyr)
+library(stringr)
+
+################################
+#### Load data ####
+################################
+
+# Load MCC dataset with urbanicity and urban environment indicators
+load("~/Sample_data_MCC-Urban.RData")
+
+
+################################
+#### First stage ####
+################################
+
+# Set options and model
+dfseas <- 4
+varfun = "bs"
+varper <- c(50,90)
+degree=2
+lag <- 10
+lagnk <- 2
+
+# Formula
+formula <- all ~ cb + dow + ns(doy,df=dfseas):factor(year) 
+
+# To save estimates 
+citysel <- cities_ucd_2$city_period
+coef <- matrix(NA,length(citysel),length(varper)+2,dimnames=list(citysel))
+vcov <-  vector("list",length(citysel))
+names(vcov) <- citysel
+coef_heat <- matrix(NA,length(citysel),2,dimnames=list(citysel))
+
+# Run the model for each city
+for(k in seq(length(dlist_summer))) {
+  
+  data <- dlist_summer[[k]]
+  
+  print(paste0("75th percentile-",names(dlist_summer)[k]))
+  
+  argvar <- list(fun=varfun,degree=degree,knots=quantile(data$tmean,varper/100,na.rm=T))
+  cb <- crossbasis(data$tmean,lag=lag,argvar=argvar, arglag=list(knots=logknots(lag,lagnk)),group=data$year)
+  
+  model <-glm(formula,family=quasipoisson,data=data,na.action="na.exclude")
+  red<-crossreduce(cb,model)
+  coef[k,]<-coef(red)
+  vcov[[k]]<-vcov(red)
+  
+  # vs 75th percentile
+  predvar <- quantile(data$tmean,seq(0,100,0.5)/100,na.rm=T)
+  b1<-onebasis(x=predvar,fun=varfun,knots=quantile(predvar,varper/100,na.rm=T),degree=degree)
+  pred_heat<-crosspred(b1,coef=coef(red),vcov=vcov(red),model.link="log",at=quantile(data$tmean,0.99,na.rm=T),cen=quantile(data$tmean,0.75,na.rm=T))
+  coef_heat[k,]<-c(pred_heat$allfit,pred_heat$allse^2)
+} 
+
+# Set city, country info
+coef_heat <- coef_heat %>% as.data.frame()
+coef_heat$city_period <- rownames(coef_heat)
+coef_heat$country_period <- lapply(strsplit(coef_heat$city_period, "\\."), function(x) x[2]) %>% unlist()
+
+
+
+################################
+#### Second stage ####
+################################
+
+# Create metadata
+meta_ref <- data.frame(unique(mcc.indicators.ucd2[,c("region","country_period")]))
+meta_ref$region2 <- ifelse(meta_ref$region %in% c("North Europe","Central Europe","South Europe"), "Europe",
+                           ifelse(meta_ref$region %in% c("Central America", "South America"), "Latin America", as.character(meta_ref$region)))
+meta_ref$region2 <- factor(meta_ref$region2, levels=c("Latin America", "North America", "East Asia", "Europe"))
+meta_ref <- meta_ref[order(meta_ref$region2),]
+
+# To save estimates
+region_list <- unique(meta_ref$region2)
+tab_heatRR <- data.frame(region=c(as.character(region_list), "Total"),
+                         RR=NA,
+                         lci=NA,
+                         uci=NA)
+
+# Meta-regression
+## 1) Total
+model <- mixmeta(coef_heat[,1], coef_heat[,2], random=~1|country_period, data=coef_heat)
+tab_heatRR[tab_heatRR$region=="Total","RR"] <- exp(model$coefficients)
+tab_heatRR[tab_heatRR$region=="Total","lci"] <- exp(confint(model))[1]
+tab_heatRR[tab_heatRR$region=="Total","uci"] <- exp(confint(model))[2]
+
+## 2) By regions
+for (i in 1:length(region_list)){
+  
+  temp_region <- region_list[i]
+  temp_country <- meta_ref[meta_ref$region2 == temp_region,]$country_period %>% unique()
+  temp_coef_heat <- coef_heat[grepl(paste(temp_country, collapse = "|") , coef_heat$country_period),]
+  print(paste0("---", temp_region, " : ", paste(temp_country, collapse = ", ")))
+  
+  model <- mixmeta(temp_coef_heat[,1], temp_coef_heat[,2], random=~1|country_period, data=temp_coef_heat)
+  tab_heatRR[tab_heatRR$region==temp_region,"RR"] <- exp(model$coefficients)
+  tab_heatRR[tab_heatRR$region==temp_region,"lci"] <- exp(confint(model))[1]
+  tab_heatRR[tab_heatRR$region==temp_region,"uci"] <- exp(confint(model))[2]
+}
+
+
+
+################################
+#### Third stage ####
+#### (1) Urbanicity 
+################################
+
+# Metadata at city level
+rawmetadata <- mcc.indicators.ucd2
+
+# Region grouping
+rawmetadata <- left_join(rawmetadata, meta_ref[,c("country_period","region2")], by="country_period")
+
+# Calculate average of daily mean temperature and range of daily mean temperature by city
+avgtmean <- sapply(dlist_summer,function(x) mean(x$tmean,na.rm=T))
+rangetmean <- sapply(dlist_summer,function(x) diff(range(x$tmean,na.rm=T)))
+rawmetadata$avgtmean <- avgtmean
+rawmetadata$rangetmean <- rangetmean
+
+# Calculate Built-up population density
+rawmetadata$"Population per Built-up areas" <- rawmetadata$Population / rawmetadata$`Built-up areas`
+
+# Calculate CO2 emissions in urban-related sectors
+rawmetadata$E_EC2_I <- rowSums(rawmetadata[, c("E_EC2E_I", "E_EC2O_I")], na.rm = TRUE)
+rawmetadata$E_EC2_R <- rowSums(rawmetadata[, c("E_EC2E_R", "E_EC2O_R")], na.rm = TRUE)
+rawmetadata$E_EC2_T <- rowSums(rawmetadata[, c("E_EC2E_T", "E_EC2O_T")], na.rm = TRUE)
+rawmetadata$E_EC2_U <- rowSums(rawmetadata[, c("E_EC2_I", "E_EC2_R", "E_EC2_T")], na.rm = TRUE)
+
+# Calculate IQR
+metadata_iqr<-data.frame(city_period=rawmetadata$city_period, 
+                         country_period=rawmetadata$country_period,
+                         region2=rawmetadata$region2,
+                         kgclzone=rawmetadata$kgclzone,
+                         kgclzone1=rawmetadata$kgclzone1,
+                         
+                         # Urbanicity (UCDB database)
+                         Population=(rawmetadata$Population)/diff(quantile(rawmetadata$Population,c(0.25,0.75),na.rm=T)),
+                         Pop_Builtup=(rawmetadata$`Population per Built-up areas`)/diff(quantile(rawmetadata$`Population per Built-up areas`,c(0.25,0.75),na.rm=T)),
+                         Builtup=(rawmetadata$`Built-up areas`)/diff(quantile(rawmetadata$`Built-up areas`,c(0.25,0.75),na.rm=T)),
+                         
+                         # Urbanicity (OECD database)
+                         Density=(rawmetadata$Density)/diff(quantile(rawmetadata$Density,c(0.25,0.75),na.rm=T)),
+                         
+                         # Urban environment indicators (UCDB database)
+                         E_GR_AV=(rawmetadata$E_GR_AV)/diff(quantile(rawmetadata$E_GR_AV,c(0.25,0.75),na.rm=T)),
+                         E_CPM2_T=(rawmetadata$E_CPM2_T)/diff(quantile(rawmetadata$E_CPM2_T,c(0.25,0.75),na.rm=T)),
+                         E_EC2_I=(rawmetadata$E_EC2_I)/diff(quantile(rawmetadata$E_EC2_I,c(0.25,0.75),na.rm=T)),
+                         E_EC2_R=(rawmetadata$E_EC2_R)/diff(quantile(rawmetadata$E_EC2_R,c(0.25,0.75),na.rm=T)),
+                         E_EC2_T=(rawmetadata$E_EC2_T)/diff(quantile(rawmetadata$E_EC2_T,c(0.25,0.75),na.rm=T)),
+                         E_EC2_U=(rawmetadata$E_EC2_U)/diff(quantile(rawmetadata$E_EC2_U,c(0.25,0.75),na.rm=T)),
+                         UHI_day=(rawmetadata$UHI_day)/diff(quantile(rawmetadata$UHI_day,c(0.25,0.75),na.rm=T)),
+                         UHI_night=(rawmetadata$UHI_night)/diff(quantile(rawmetadata$UHI_night,c(0.25,0.75),na.rm=T)),
+                         
+                         avgtmean=avgtmean, rangetmean=rangetmean,
+                         lat=rawmetadata$lat.x, long=rawmetadata$long.x)
+metadata_iqr$country_period <- as.factor(metadata_iqr$country_period)
+avgtmean <- rangetmean <- NULL
+
+# Sort
+metadata_iqr <- metadata_iqr[order(metadata_iqr$country_period, metadata_iqr$city),]
+metadata_iqr$city == cities_ucd_2$city_period
+metadata_iqr$city == rownames(coef_heat)
+unique(metadata_iqr$country_period) == countries_ucd_2$country_period
+
+
+# To save estimates
+list_meta2 <- list()
+var_list <- c("Pop_Builtup","Density")
+
+# Meta regression
+for (k in 1:length(var_list)){
+  
+  temp_var <- var_list[[k]]
+  print(paste0("== Variable: ", temp_var))
+  
+  # Result dataframe
+  tab_meta2 <- data.frame(region=c(as.character(region_list),"Total"),
+                          var=NA,
+                          coef=NA,
+                          se=NA,
+                          lci=NA,
+                          uci=NA)
+  
+  ## 1) Total
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+",
+                 temp_var,"+region2",
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  
+  # (Note) =================================
+  # The line above is the original code, but since the sample data only includes one country,
+  # the code is slightly modified to prevent errors like below.
+  # ========================================
+  
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+",
+                 temp_var,
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  eval(parse(text = text))
+  summary(meta)
+  
+  coef <- coef(meta)
+  vcov <- vcov(meta)
+  tab_meta2[tab_meta2$region=="Total","coef"] <- round(coef[temp_var],3) 
+  tab_meta2[tab_meta2$region=="Total","se"] <- round(sqrt(vcov[temp_var,temp_var]),5) 
+  tab_meta2[tab_meta2$region=="Total","lci"] <- round(round(coef[temp_var],3)-1.96*round(sqrt(vcov[temp_var,temp_var]),5), 5) 
+  tab_meta2[tab_meta2$region=="Total","uci"] <- round(round(coef[temp_var],3)+1.96*round(sqrt(vcov[temp_var,temp_var]),5), 5) 
+  
+  
+  ## 2) By region
+  
+  # (Note) =================================
+  # Since the sample data only includes one country, the code below will cause an error.
+  # However, it is kept here for reference to show the original code.
+  # ========================================
+  
+  # Meta regression (using interaction term)
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+",
+                 temp_var,"+region2",
+                 paste0("+",temp_var,":region2"),
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  
+  try({
+    eval(parse(text = text))
+    summary(meta)
+    
+    # coef
+    tab_meta2[,"var"] <- temp_var
+    coef <- coef(meta)
+    coef_urban <- c(coef[temp_var] + coef[grep(paste0(temp_var,":region2"), names(coef))]) 
+    tab_meta2[2:length(region_list),"coef"] <- round(coef_urban,3)
+    tab_meta2[1,"coef"] <- round(coef[temp_var],3) # reference
+    
+    # vcov
+    vcov <- vcov(meta)
+    
+    for (i in (1:(length(region_list)-1))) {
+      
+      temp_country <- names(coef)[grep(paste0(temp_var,":region2"), names(coef))][i]
+      print(paste0("---- ", temp_country))
+      
+      sqrt(sum(vcov[c(temp_var,temp_country), c(temp_var,temp_country)]))
+      temp_vcov <- sum(vcov[c(temp_var,temp_country), c(temp_var,temp_country)])
+      
+      tab_meta2[i+1,"se"] <- round(sqrt(temp_vcov),3)
+      tab_meta2[i+1,"lci"] <- round(coef_urban[temp_country] - 1.96*sqrt(temp_vcov),3)
+      tab_meta2[i+1,"uci"] <- round(coef_urban[temp_country] + 1.96*sqrt(temp_vcov),3)
+    } 
+  }, silent=TRUE)
+  
+  tab_meta2[1,"se"] <- round(sqrt(vcov[temp_var, temp_var]),3)
+  tab_meta2[1,"lci"] <- round(tab_meta2[1,"coef"] - 1.96*sqrt(vcov[temp_var, temp_var]),3)
+  tab_meta2[1,"uci"] <- round(tab_meta2[1,"coef"] + 1.96*sqrt(vcov[temp_var, temp_var]),3)
+  
+  # save
+  list_meta2[[temp_var]] <- tab_meta2
+  
+}
+
+
+
+################################
+#### Third stage ####
+#### (2) Environment indicators
+################################
+
+# To save estimates
+list_meta_factor_2 <- list()
+var_list_factor <- c("E_GR_AV","E_CPM2_T","E_EC2_U","UHI_night")
+
+# Meta regression
+for (k in 1:length(var_list_factor)){
+  
+  # Result dataframe
+  tab_meta_factor_2 <- data.frame(region=c( as.character(region_list),"Total"),
+                                  var=NA,
+                                  coef=NA,
+                                  se=NA,
+                                  lci=NA,
+                                  uci=NA)
+  temp_var <- var_list_factor[[k]]
+  print(paste0("== Variable: ", temp_var))
+  tab_meta_factor_2[,"var"] <- temp_var
+  
+  
+  ## 1) Total
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+E_GR_AV+E_CPM2_T+E_EC2_U+UHI_night+region2",
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  
+  # (Note) =================================
+  # The line above is the original code, but since the sample data only includes one country,
+  # the code is slightly modified to prevent errors like below.
+  # ========================================
+  
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+E_GR_AV+E_CPM2_T+E_EC2_U+UHI_night",
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  
+  eval(parse(text = text))
+  summary(meta)
+  
+  coef <- coef(meta)
+  vcov <- vcov(meta)
+  tab_meta_factor_2[tab_meta_factor_2$region=="Total","coef"] <- coef[temp_var] 
+  tab_meta_factor_2[tab_meta_factor_2$region=="Total","se"] <- sqrt(vcov[temp_var,temp_var]) 
+  tab_meta_factor_2[tab_meta_factor_2$region=="Total","lci"] <- coef[temp_var]-1.96*sqrt(vcov[temp_var,temp_var])
+  tab_meta_factor_2[tab_meta_factor_2$region=="Total","uci"] <- coef[temp_var]+1.96*sqrt(vcov[temp_var,temp_var])
+  
+  
+  ## 2) By region
+  
+  # (Note) =================================
+  # Since the sample data only includes one country, the code below will cause an error.
+  # However, it is kept here for reference to show the original code.
+  # ========================================
+  
+  # Meta regression (using interaction term)
+  text <- paste0("meta <- mixmeta(coef_heat[,1]~avgtmean+rangetmean+kgclzone1+E_GR_AV+E_CPM2_T+E_EC2_U+UHI_night+region2",
+                 paste0("+",temp_var,":region2"),
+                 ",coef_heat[,2],random=~1|country_period, metadata_iqr)")
+  
+  try({
+    eval(parse(text = text))
+    summary(meta)
+    
+    # coef
+    tab_meta_factor_2[,"var"] <- temp_var
+    coef <- coef(meta)
+    coef_urban <- c(coef[temp_var] + coef[grep(paste0(temp_var,":region2"), names(coef))]) 
+    tab_meta_factor_2[2:length(region_list),"coef"] <- round(coef_urban,3)
+    tab_meta_factor_2[1,"coef"] <- round(coef[temp_var],3) #Brazile이 interaction항 ref
+    
+    # vcov
+    vcov <- vcov(meta)
+    
+    for (i in (1:(length(region_list)-1))) {
+      
+      temp_country <- names(coef)[grep(paste0(temp_var,":region2"), names(coef))][i]
+      print(paste0("---- ", temp_country))
+      
+      sqrt(sum(vcov[c(temp_var,temp_country), c(temp_var,temp_country)]))
+      temp_vcov <- sum(vcov[c(temp_var,temp_country), c(temp_var,temp_country)])
+      
+      tab_meta_factor_2[i+1,"se"] <- sqrt(temp_vcov)
+      tab_meta_factor_2[i+1,"lci"] <- coef_urban[temp_country] - 1.96*sqrt(temp_vcov)
+      tab_meta_factor_2[i+1,"uci"] <- coef_urban[temp_country] + 1.96*sqrt(temp_vcov)
+    } 
+  }, silent=TRUE)
+
+  tab_meta_factor_2[1,"se"] <- sqrt(vcov[temp_var, temp_var])
+  tab_meta_factor_2[1,"lci"] <- tab_meta_factor_2[1,"coef"] - 1.96*sqrt(vcov[temp_var, temp_var])
+  tab_meta_factor_2[1,"uci"] <- tab_meta_factor_2[1,"coef"] + 1.96*sqrt(vcov[temp_var, temp_var])
+  
+  # save
+  list_meta_factor_2[[temp_var]] <- tab_meta_factor_2
+  
+}
+
+
+
+################################
+#### Example Results ####
+################################
+
+# (Note) =================================
+# This analysis is based on sample data and does not reflect actual results.
+# ========================================
+
+# Heat-mortality RR (with95% CI)
+tab_heatRR$RR
+tab_heatRR$lci
+tab_heatRR$uci
+
+# Percentage change in heat-mortality risk by urbanicity level (with 95% CI)
+## Population density
+(exp(list_meta2[["Density"]]$coef) - 1) * 100
+(exp(list_meta2[["Density"]]$lci) - 1) * 100
+(exp(list_meta2[["Density"]]$uci) - 1) * 100
+## Built-up population density
+(exp(list_meta2[["Pop_Builtup"]]$coef) - 1) * 100
+(exp(list_meta2[["Pop_Builtup"]]$lci) - 1) * 100
+(exp(list_meta2[["Pop_Builtup"]]$uci) - 1) * 100
+
+# Percentage change in heat-mortality risk by environmental indicators (with 95% CI)
+## Emission of CO2 in urban related sectors
+(exp(list_meta_factor_2[["E_EC2_U"]]$coef) - 1) * 100
+(exp(list_meta_factor_2[["E_EC2_U"]]$lci) - 1) * 100
+(exp(list_meta_factor_2[["E_EC2_U"]]$uci) - 1) * 100
